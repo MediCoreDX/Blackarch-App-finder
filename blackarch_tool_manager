@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+# BlackArch Tool Manager - GUI for the locally configured BlackArch pacman repository
+# License: MIT
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import (
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QSplitter, QStatusBar, QTableWidget, QTableWidgetItem, QTextEdit,
+    QVBoxLayout, QWidget, QHeaderView
+)
+
+APP_NAME = "BlackArch Tool Manager"
+REPO = "blackarch"
+PACKAGE_RE = re.compile(r"^[a-zA-Z0-9@._+-]+$")
+
+
+@dataclass
+class Package:
+    name: str
+    version: str = ""
+    description: str = ""
+    installed: bool = False
+    groups: set = field(default_factory=set)
+
+
+def run_command(args, timeout=1800):
+    """Run a command without a shell; return (returncode, stdout, stderr)."""
+    try:
+        p = subprocess.run(
+            args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, check=False
+        )
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", f"Befehl nicht gefunden: {args[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "", "Zeitüberschreitung beim Ausführen des Befehls."
+
+
+class Worker(QThread):
+    finished_data = Signal(object, str)
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, task, package=None, parent=None):
+        super().__init__(parent)
+        self.task = task
+        self.package = package
+
+    def run(self):
+        try:
+            if self.task == "load":
+                self.progress.emit("BlackArch-Paketdatenbank wird gelesen …")
+                rc, search, err = run_command(["pacman", "-Ss", "."], timeout=900)
+                if rc != 0:
+                    raise RuntimeError(err.strip() or "pacman -Ss konnte nicht ausgeführt werden.")
+                rc2, groups_out, err2 = run_command(["pacman", "-Sgg"], timeout=900)
+                if rc2 != 0:
+                    raise RuntimeError(err2.strip() or "pacman -Sgg konnte nicht ausgeführt werden.")
+                rc3, installed_out, err3 = run_command(["pacman", "-Qq"], timeout=900)
+                if rc3 != 0:
+                    raise RuntimeError(err3.strip() or "Installationsstatus konnte nicht gelesen werden.")
+
+                installed = set(installed_out.splitlines())
+                packages = {}
+                current = None
+
+                # pacman -Ss format:
+                # repo/name version [installed]
+                #     description
+                for line in search.splitlines():
+                    if line and not line[0].isspace() and "/" in line:
+                        left = line.split()
+                        repo_name = left[0]
+                        if repo_name.startswith(REPO + "/"):
+                            name = repo_name.split("/", 1)[1]
+                            version = left[1] if len(left) > 1 else ""
+                            current = Package(
+                                name=name, version=version,
+                                installed=(name in installed)
+                            )
+                            packages[name] = current
+                        else:
+                            current = None
+                    elif current is not None and line[:1].isspace():
+                        desc = line.strip()
+                        if desc and not current.description:
+                            current.description = desc
+
+                # The group database is the authoritative list of BlackArch tools
+                # and categories. Include packages from every blackarch-* group.
+                for line in groups_out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0].startswith("blackarch"):
+                        group, name = parts[0], parts[1]
+                        if name in packages:
+                            packages[name].groups.add(group)
+
+                # Some repo packages may not belong to a category group. Keep them.
+                if not packages:
+                    raise RuntimeError(
+                        "Keine Pakete aus dem Repository 'blackarch' gefunden. "
+                        "Prüfe, ob [blackarch] in /etc/pacman.conf aktiviert ist "
+                        "und ob die Paketdatenbanken synchronisiert wurden."
+                    )
+                self.finished_data.emit(packages, "Paketliste geladen.")
+                return
+
+            if self.task in ("install", "remove"):
+                name = self.package or ""
+                if not PACKAGE_RE.fullmatch(name):
+                    raise RuntimeError("Ungültiger Paketname.")
+                if self.task == "install":
+                    self.progress.emit(f"{name} wird installiert …")
+                    args = ["pkexec", "pacman", "-S", "--needed", "--noconfirm", name]
+                else:
+                    self.progress.emit(f"{name} wird entfernt …")
+                    # -R removes only the selected package; it deliberately does not
+                    # autoremove shared dependencies from the user's system.
+                    args = ["pkexec", "pacman", "-R", "--noconfirm", name]
+                rc, out, err = run_command(args, timeout=3600)
+                combined = (out + "\n" + err).strip()
+                if rc != 0:
+                    raise RuntimeError(combined or f"Vorgang fehlgeschlagen (Exit-Code {rc}).")
+                self.finished_data.emit(None, combined or "Vorgang erfolgreich abgeschlossen.")
+                return
+
+            if self.task == "upgrade":
+                self.progress.emit("Paketdatenbanken werden synchronisiert …")
+                # Only refresh repository databases. Never upgrade Manjaro or packages here.
+                rc, out, err = run_command(
+                    ["pkexec", "pacman", "-Syy"], timeout=1800
+                )
+                combined = (out + "\n" + err).strip()
+                if rc != 0:
+                    raise RuntimeError(combined or f"Update fehlgeschlagen (Exit-Code {rc}).")
+                self.finished_data.emit(None, combined or "Paketdatenbanken erfolgreich synchronisiert.")
+                return
+
+            raise RuntimeError("Unbekannter Vorgang.")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.resize(1180, 760)
+        self.packages = {}
+        self.worker = None
+        self._build_ui()
+        self._check_environment()
+        self.load_packages()
+
+    def _build_ui(self):
+        self.setStyleSheet("""
+            QMainWindow, QWidget { background: #101923; color: #e7eef5; }
+            QLabel#heading { color: #62d6a4; font-size: 22px; font-weight: 700; }
+            QLabel#muted { color: #9aabba; }
+            QLineEdit, QComboBox, QTextEdit {
+                background: #182633; color: #edf5fa; border: 1px solid #304657;
+                border-radius: 7px; padding: 8px;
+            }
+            QPushButton {
+                background: #1d795f; color: white; border: 0; border-radius: 7px;
+                padding: 9px 15px; font-weight: 600;
+            }
+            QPushButton:hover { background: #269b78; }
+            QPushButton:disabled { background: #34444f; color: #84939d; }
+            QPushButton#secondary { background: #294052; }
+            QPushButton#danger { background: #9d3e4b; }
+            QTableWidget {
+                background: #14212c; alternate-background-color: #192a37;
+                gridline-color: #2b3e4b; border: 1px solid #304657;
+                selection-background-color: #245c50;
+            }
+            QHeaderView::section {
+                background: #203342; color: #cfe0e9; padding: 8px;
+                border: 0; font-weight: 700;
+            }
+            QProgressBar {
+                background: #1b2b37; border: 1px solid #304657; border-radius: 5px;
+                text-align: center; min-height: 16px;
+            }
+            QProgressBar::chunk { background: #35b889; border-radius: 4px; }
+            QStatusBar { background: #0d151d; color: #9aabba; }
+        """)
+
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(18, 16, 18, 12)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title = QLabel("BLACKARCH TOOL MANAGER")
+        title.setObjectName("heading")
+        subtitle = QLabel("Repository-Scanner • Paketverwaltung • Manjaro / Arch")
+        subtitle.setObjectName("muted")
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        header.addLayout(title_col)
+        header.addStretch()
+        self.count_label = QLabel("0 Pakete")
+        self.count_label.setObjectName("muted")
+        header.addWidget(self.count_label)
+        layout.addLayout(header)
+
+        controls = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Tools suchen: Name oder Beschreibung …")
+        self.search.textChanged.connect(self.apply_filters)
+        controls.addWidget(self.search, 3)
+
+        self.category = QComboBox()
+        self.category.addItem("Alle Kategorien", "")
+        self.category.currentIndexChanged.connect(self.apply_filters)
+        controls.addWidget(self.category, 1)
+
+        self.status_filter = QComboBox()
+        self.status_filter.addItem("Alle Status", "all")
+        self.status_filter.addItem("Installiert", "installed")
+        self.status_filter.addItem("Nicht installiert", "available")
+        self.status_filter.currentIndexChanged.connect(self.apply_filters)
+        controls.addWidget(self.status_filter, 1)
+        layout.addLayout(controls)
+
+        splitter = QSplitter(Qt.Horizontal)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Paket / Tool", "Version", "Kategorie", "Status"])
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.itemSelectionChanged.connect(self.show_selected)
+        splitter.addWidget(self.table)
+
+        detail_panel = QWidget()
+        detail_layout = QVBoxLayout(detail_panel)
+        detail_layout.setContentsMargins(12, 0, 0, 0)
+        detail_title = QLabel("Tool-Details")
+        detail_title.setStyleSheet("font-size: 16px; font-weight: 700; color: #62d6a4;")
+        detail_layout.addWidget(detail_title)
+        self.detail_name = QLabel("Wähle ein Paket aus der Liste.")
+        self.detail_name.setWordWrap(True)
+        self.detail_name.setStyleSheet("font-size: 15px; font-weight: 700;")
+        detail_layout.addWidget(self.detail_name)
+        self.detail_text = QTextEdit()
+        self.detail_text.setReadOnly(True)
+        self.detail_text.setPlaceholderText("Beschreibung und Paketinformationen")
+        detail_layout.addWidget(self.detail_text, 1)
+        self.install_btn = QPushButton("⬇  Installieren")
+        self.install_btn.clicked.connect(self.install_selected)
+        self.remove_btn = QPushButton("✕  Deinstallieren")
+        self.remove_btn.setObjectName("danger")
+        self.remove_btn.clicked.connect(self.remove_selected)
+        detail_layout.addWidget(self.install_btn)
+        detail_layout.addWidget(self.remove_btn)
+        splitter.addWidget(detail_panel)
+        splitter.setSizes([780, 340])
+        layout.addWidget(splitter, 1)
+
+        bottom = QHBoxLayout()
+        self.refresh_btn = QPushButton("↻  Liste neu einlesen")
+        self.refresh_btn.setObjectName("secondary")
+        self.refresh_btn.clicked.connect(self.load_packages)
+        self.update_btn = QPushButton("BlackArch-Datenbanken synchronisieren")
+        self.update_btn.setObjectName("secondary")
+        self.update_btn.clicked.connect(self.update_system)
+        bottom.addWidget(self.refresh_btn)
+        bottom.addWidget(self.update_btn)
+        bottom.addStretch()
+        layout.addLayout(bottom)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        layout.addWidget(self.progress)
+
+        self.setCentralWidget(root)
+        self.setStatusBar(QStatusBar())
+        self.statusBar().showMessage("Bereit")
+
+    def _check_environment(self):
+        if not shutil.which("pacman"):
+            QMessageBox.critical(self, APP_NAME, "pacman wurde nicht gefunden. Diese App benötigt Arch/Manjaro mit pacman.")
+            return
+        rc, out, _ = run_command(["pacman-conf", "--repo-list"])
+        repos = out.splitlines() if rc == 0 else []
+        if REPO not in repos:
+            QMessageBox.warning(
+                self, "BlackArch-Repository nicht gefunden",
+                "In deiner pacman-Konfiguration wurde kein aktives Repository "
+                "'blackarch' erkannt.\n\nDie App kann erst alle BlackArch-Pakete "
+                "anzeigen, wenn [blackarch] in /etc/pacman.conf eingerichtet und "
+                "die Paketdatenbank synchronisiert ist."
+            )
+
+    def set_busy(self, busy, message=""):
+        self.progress.setRange(0, 0 if busy else 1)
+        self.progress.setVisible(busy)
+        for widget in (self.refresh_btn, self.update_btn, self.install_btn, self.remove_btn):
+            widget.setEnabled(not busy)
+        if message:
+            self.statusBar().showMessage(message)
+
+    def start_worker(self, task, package=None):
+        if self.worker and self.worker.isRunning():
+            return
+        self.set_busy(True, "Vorgang wird gestartet …")
+        self.worker = Worker(task, package, self)
+        self.worker.progress.connect(lambda msg: self.statusBar().showMessage(msg))
+        self.worker.finished_data.connect(self.worker_finished)
+        self.worker.failed.connect(self.worker_failed)
+        self.worker.start()
+
+    def load_packages(self):
+        self.start_worker("load")
+
+    def worker_finished(self, data, message):
+        task = self.worker.task if self.worker else ""
+        if self.worker:
+            self.worker.wait()
+        self.set_busy(False)
+        if task == "load":
+            self.packages = data
+            self.populate_categories()
+            self.apply_filters()
+            self.statusBar().showMessage(
+                f"{len(self.packages)} BlackArch-Pakete aus der lokalen Paketdatenbank geladen."
+            )
+        else:
+            QMessageBox.information(self, APP_NAME, message[-6000:] if message else "Vorgang abgeschlossen.")
+            self.load_packages()
+
+    def worker_failed(self, message):
+        self.set_busy(False)
+        QMessageBox.critical(self, "Vorgang fehlgeschlagen", message[-6000:])
+        self.statusBar().showMessage("Fehler – Details im Dialog")
+
+    def populate_categories(self):
+        current = self.category.currentData()
+        self.category.blockSignals(True)
+        self.category.clear()
+        self.category.addItem("Alle Kategorien", "")
+        groups = sorted({g for p in self.packages.values() for g in p.groups})
+        for group in groups:
+            label = group.removeprefix("blackarch-")
+            if group == "blackarch":
+                label = "Hauptgruppe"
+            self.category.addItem(label, group)
+        idx = self.category.findData(current)
+        self.category.setCurrentIndex(max(0, idx))
+        self.category.blockSignals(False)
+
+    def apply_filters(self):
+        query = self.search.text().strip().casefold()
+        category = self.category.currentData()
+        status = self.status_filter.currentData()
+        rows = []
+        for pkg in self.packages.values():
+            if query and query not in pkg.name.casefold() and query not in pkg.description.casefold():
+                continue
+            if category and category not in pkg.groups:
+                continue
+            if status == "installed" and not pkg.installed:
+                continue
+            if status == "available" and pkg.installed:
+                continue
+            rows.append(pkg)
+        rows.sort(key=lambda p: (not p.installed, p.name.casefold()))
+        self.table.setRowCount(len(rows))
+        for r, pkg in enumerate(rows):
+            category_text = ", ".join(sorted(
+                "Hauptgruppe" if g == "blackarch" else g.removeprefix("blackarch-")
+                for g in pkg.groups
+            )) or "—"
+            values = [pkg.name, pkg.version, category_text, "Installiert" if pkg.installed else "Verfügbar"]
+            for c, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.UserRole, pkg.name)
+                if c == 3:
+                    item.setForeground(Qt.green if pkg.installed else Qt.lightGray)
+                self.table.setItem(r, c, item)
+        self.count_label.setText(f"{len(rows)} / {len(self.packages)} Pakete")
+        self.install_btn.setEnabled(False)
+        self.remove_btn.setEnabled(False)
+        self.detail_name.setText("Wähle ein Paket aus der Liste.")
+        self.detail_text.clear()
+
+    def selected_package(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        return self.packages.get(item.data(Qt.UserRole)) if item else None
+
+    def show_selected(self):
+        pkg = self.selected_package()
+        if not pkg:
+            return
+        self.detail_name.setText(pkg.name)
+        groups = ", ".join(sorted(pkg.groups)) or "Keine Kategoriegruppe"
+        self.detail_text.setPlainText(
+            f"Version: {pkg.version or 'unbekannt'}\n"
+            f"Status: {'Installiert' if pkg.installed else 'Nicht installiert'}\n"
+            f"Kategorien: {groups}\n\n"
+            f"{pkg.description or 'Keine Beschreibung in der Paketdatenbank vorhanden.'}\n\n"
+            "Quelle: lokale pacman-Synchronisationsdatenbank (Repository blackarch)."
+        )
+        self.install_btn.setEnabled(not pkg.installed)
+        self.remove_btn.setEnabled(pkg.installed)
+
+    def install_selected(self):
+        pkg = self.selected_package()
+        if not pkg or pkg.installed:
+            return
+        answer = QMessageBox.question(
+            self, "Installation bestätigen",
+            f"'{pkg.name}' aus dem BlackArch-Repository installieren?\n\n"
+            "Pacman installiert erforderliche Abhängigkeiten. Dafür wird eine "
+            "Authentifizierung über pkexec angefordert.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if answer == QMessageBox.Yes:
+            self.start_worker("install", pkg.name)
+
+    def remove_selected(self):
+        pkg = self.selected_package()
+        if not pkg or not pkg.installed:
+            return
+        answer = QMessageBox.warning(
+            self, "Deinstallation bestätigen",
+            f"'{pkg.name}' deinstallieren?\n\n"
+            "Es wird nur dieses Paket entfernt. Gemeinsame Abhängigkeiten "
+            "werden absichtlich nicht automatisch gelöscht.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if answer == QMessageBox.Yes:
+            self.start_worker("remove", pkg.name)
+
+    def update_system(self):
+        answer = QMessageBox.warning(
+            self, "Paketdatenbanken synchronisieren",
+            "Dieser Vorgang führt ausschließlich 'pacman -Syy' aus.\n\n"
+            "Es werden nur die Paketdatenbanken (core, extra, multilib und "
+            "blackarch) neu geladen. Es werden KEINE Pakete installiert oder "
+            "aktualisiert und dein Manjaro-System wird nicht verändert.\n\n"
+            "Vorher laufende Paketmanager schließen.\n\n"
+            "Jetzt synchronisieren?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if answer == QMessageBox.Yes:
+            self.start_worker("upgrade")
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setFont(QFont("Noto Sans", 10))
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
